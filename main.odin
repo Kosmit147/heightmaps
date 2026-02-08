@@ -11,20 +11,32 @@ import "core:math/linalg"
 Vec2 :: [2]f32
 Mat4 :: matrix[4, 4]f32
 
-Vertex :: struct { position: Vec2 }
-@(rodata) vertex_format := [?]glue.Vertex_Attribute{ .Float_2 }
+Vertex :: struct {
+	position: Vec2,
+	uv: Vec2,
+}
+
+@(rodata)
+vertex_format := [?]glue.Vertex_Attribute{
+	.Float_2,
+	.Float_2,
+}
 
 VERTEX_SOURCE ::
 `
 #version 460 core
 
 layout (location = 0) in vec2 in_position;
+layout (location = 1) in vec2 in_uv;
 
 uniform mat4 projection;
 uniform mat4 view;
 uniform mat4 model;
 
+out vec2 UV;
+
 void main() {
+	UV = in_uv;
 	gl_Position = projection * view * model * vec4(in_position, 0.0, 1.0);
 }
 `
@@ -33,19 +45,23 @@ FRAGMENT_SOURCE ::
 `
 #version 460 core
 
+in vec2 UV;
+
 out vec4 out_color;
 
+layout (binding = 0) uniform sampler2D texture_0;
+
 void main() {
-	out_color = vec4(1.0);
+	out_color = texture(texture_0, UV);
 }
 `
 
 @(rodata)
 vertices := [4]Vertex{
-	{ position = { -0.5, -0.5 } },
-	{ position = { -0.5,  0.5 } },
-	{ position = {  0.5,  0.5 } },
-	{ position = {  0.5, -0.5 } },
+	{ position = { -0.5, -0.5 }, uv = { 0, 0 } },
+	{ position = { -0.5,  0.5 }, uv = { 0, 1 } },
+	{ position = {  0.5,  0.5 }, uv = { 1, 1 } },
+	{ position = {  0.5, -0.5 }, uv = { 1, 0 } },
 }
 
 @(rodata)
@@ -78,9 +94,15 @@ main :: proc() {
 	glue.create_static_gl_buffer_with_data(&index_buffer, slice.to_bytes(indices[:]))
 	defer glue.destroy_gl_buffer(&index_buffer)
 
-	shader, shader_ok := glue.create_shader(VERTEX_SOURCE, FRAGMENT_SOURCE)
+	shader, shader_ok := glue.create_simple_shader(VERTEX_SOURCE, FRAGMENT_SOURCE)
 	if !shader_ok do log.panic("Failed to compile the shader.")
 	defer glue.destroy_shader(shader)
+
+	texture_parameters := glue.DEFAULT_TEXTURE_PARAMETERS
+	texture_parameters.internal_format = gl.R8
+	texture, texture_ok := glue.create_texture_from_png_file("iceland.png", texture_parameters)
+	if !texture_ok do log.panic("Failed to load the texture.")
+	defer glue.destroy_texture(&texture)
 
 	camera := glue.Camera {
 		position = { 0, 0, 2 },
@@ -96,6 +118,7 @@ main :: proc() {
 	glue.bind_vertex_buffer(vertex_array, vertex_buffer, size_of(Vertex))
 	glue.bind_index_buffer(vertex_array, index_buffer)
 	glue.use_shader(shader)
+	glue.bind_texture(texture, 0)
 
 	gl.ClearColor(0, 0, 0, 1)
 
@@ -149,3 +172,8 @@ main :: proc() {
 		free_all(context.temp_allocator)
 	}
 }
+
+@(export, rodata)
+NvOptimusEnablement: u32 = 1
+@(export, rodata)
+AmdPowerXpressRequestHighPerformance: u32 = 1
