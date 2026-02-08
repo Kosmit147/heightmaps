@@ -3,71 +3,23 @@ package heightmaps
 import "glue"
 import gl "vendor:OpenGL"
 
+import "core:bytes"
 import "core:log"
 import "core:slice"
 import "core:math"
 import "core:math/linalg"
+import "core:image"
+import "core:image/png"
+import "core:os"
 
 Vec2 :: [2]f32
+Vec3 :: [3]f32
 Mat4 :: matrix[4, 4]f32
 
-Vertex :: struct {
-	position: Vec2,
-	uv: Vec2,
-}
+VERTEX_SOURCE :: #load("terrain.vert", string)
+FRAGMENT_SOURCE :: #load("terrain.frag", string)
 
-@(rodata)
-vertex_format := [?]glue.Vertex_Attribute{
-	.Float_2,
-	.Float_2,
-}
-
-VERTEX_SOURCE ::
-`
-#version 460 core
-
-layout (location = 0) in vec2 in_position;
-layout (location = 1) in vec2 in_uv;
-
-uniform mat4 projection;
-uniform mat4 view;
-uniform mat4 model;
-
-out vec2 UV;
-
-void main() {
-	UV = in_uv;
-	gl_Position = projection * view * model * vec4(in_position, 0.0, 1.0);
-}
-`
-
-FRAGMENT_SOURCE ::
-`
-#version 460 core
-
-in vec2 UV;
-
-out vec4 out_color;
-
-layout (binding = 0) uniform sampler2D texture_0;
-
-void main() {
-	out_color = texture(texture_0, UV);
-}
-`
-
-@(rodata)
-vertices := [4]Vertex{
-	{ position = { -0.5, -0.5 }, uv = { 0, 0 } },
-	{ position = { -0.5,  0.5 }, uv = { 0, 1 } },
-	{ position = {  0.5,  0.5 }, uv = { 1, 1 } },
-	{ position = {  0.5, -0.5 }, uv = { 1, 0 } },
-}
-
-@(rodata)
-indices := [6]u32{ 0, 1, 2, 0, 2, 3 }
-
-WINDOW_TITLE  :: "Example"
+WINDOW_TITLE  :: "Heightmaps"
 WINDOW_WIDTH  :: 1920
 WINDOW_HEIGHT :: 1080
 WINDOW_ASPECT_RATIO :: 1920.0 / 1080.0
@@ -76,36 +28,22 @@ main :: proc() {
 	context.logger = log.create_console_logger(.Debug when ODIN_DEBUG else .Info)
 	defer log.destroy_console_logger(context.logger)
 
-	if !glue.create_window(WINDOW_WIDTH, WINDOW_HEIGHT, WINDOW_TITLE) do log.panic("Failed to create a window")
+	if !glue.create_window(WINDOW_WIDTH, WINDOW_HEIGHT, WINDOW_TITLE) do log.panic("Failed to create a window.")
 	defer glue.destroy_window()
 
 	glue.set_cursor_enabled(false)
 	glue.set_raw_mouse_motion_enabled(true)
 
-	vertex_array: glue.Vertex_Array
-	glue.create_vertex_array(&vertex_array)
-	defer glue.destroy_vertex_array(&vertex_array)
-
-	vertex_buffer: glue.Gl_Buffer
-	glue.create_static_gl_buffer_with_data(&vertex_buffer, slice.to_bytes(vertices[:]))
-	defer glue.destroy_gl_buffer(&vertex_buffer)
-
-	index_buffer: glue.Gl_Buffer
-	glue.create_static_gl_buffer_with_data(&index_buffer, slice.to_bytes(indices[:]))
-	defer glue.destroy_gl_buffer(&index_buffer)
-
 	shader, shader_ok := glue.create_simple_shader(VERTEX_SOURCE, FRAGMENT_SOURCE)
 	if !shader_ok do log.panic("Failed to compile the shader.")
 	defer glue.destroy_shader(shader)
 
-	texture_parameters := glue.DEFAULT_TEXTURE_PARAMETERS
-	texture_parameters.internal_format = gl.R8
-	texture, texture_ok := glue.create_texture_from_png_file("iceland.png", texture_parameters)
-	if !texture_ok do log.panic("Failed to load the texture.")
-	defer glue.destroy_texture(&texture)
+	terrain_mesh, terrain_mesh_ok := create_terrain_mesh("iceland.png")
+	if !terrain_mesh_ok do log.panic("Failed to create the terrain mesh.")
+	defer destroy_terrain_mesh(&terrain_mesh)
 
 	camera := glue.Camera {
-		position = { 0, 0, 2 },
+		position = { 0, 100, 0 },
 		yaw = math.to_radians(f32(-90.0)),
 	}
 
@@ -113,14 +51,10 @@ main :: proc() {
 	view_uniform := glue.get_uniform(shader, "view", Mat4)
 	projection_uniform := glue.get_uniform(shader, "projection", Mat4)
 
-	glue.bind_vertex_array(vertex_array)
-	glue.set_vertex_array_format(vertex_array, vertex_format[:])
-	glue.bind_vertex_buffer(vertex_array, vertex_buffer, size_of(Vertex))
-	glue.bind_index_buffer(vertex_array, index_buffer)
 	glue.use_shader(shader)
-	glue.bind_texture(texture, 0)
 
 	gl.ClearColor(0, 0, 0, 1)
+	gl.Enable(gl.DEPTH_TEST)
 
 	prev_time := glue.time()
 
@@ -146,7 +80,7 @@ main :: proc() {
 
 		camera_vectors := glue.camera_vectors(camera)
 
-		MOVEMENT_SPEED :: 5
+		MOVEMENT_SPEED :: 100
 		if glue.key_pressed(.W) do camera.position += camera_vectors.forward * MOVEMENT_SPEED * dt
 		if glue.key_pressed(.S) do camera.position -= camera_vectors.forward * MOVEMENT_SPEED * dt
 		if glue.key_pressed(.A) do camera.position -= camera_vectors.right   * MOVEMENT_SPEED * dt
@@ -165,12 +99,94 @@ main :: proc() {
 		glue.set_uniform(view_uniform, view)
 		glue.set_uniform(projection_uniform, projection)
 
-		gl.Clear(gl.COLOR_BUFFER_BIT)
-		gl.DrawElements(gl.TRIANGLES, len(indices), glue.gl_index(u32), nil)
+		gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+		glue.bind_mesh(terrain_mesh)
+
+		for i in 0..<terrain_mesh.strip_count {
+			strip_indices_offset := size_of(Terrain_Index) * terrain_mesh.vertices_per_strip * i
+			gl.DrawElements(gl.TRIANGLE_STRIP,
+					i32(terrain_mesh.vertices_per_strip),
+					terrain_mesh.mesh.index_type,
+					cast(rawptr)uintptr(terrain_mesh.mesh.index_data_offset + strip_indices_offset))
+		}
 
 		glue.swap_buffers()
 		free_all(context.temp_allocator)
 	}
+}
+
+Terrain_Mesh :: struct {
+	using mesh: glue.Mesh,
+	strip_count: u32,
+	vertices_per_strip: u32,
+}
+
+Terrain_Vertex :: struct {
+	position: Vec3,
+}
+
+@(rodata)
+terrain_vertex_format := [?]glue.Vertex_Attribute{
+	.Float_3,
+}
+
+Terrain_Index :: u32
+
+create_terrain_mesh :: proc(path: string) -> (mesh: Terrain_Mesh, ok := false) {
+	heightmap_file_data := os.read_entire_file(path, context.temp_allocator) or_return
+	heightmap_image, error := image.load(heightmap_file_data, {}, context.temp_allocator)
+	if error != nil {
+		log.errorf("Failed to load heightmap from file `%v`: %v", path, error)
+		return
+	}
+	defer image.destroy(heightmap_image, context.temp_allocator)
+
+	pixels := bytes.buffer_to_bytes(&heightmap_image.pixels)
+
+	vertex_count := heightmap_image.width * heightmap_image.height
+	vertices := make([dynamic]Terrain_Vertex, 0, vertex_count, context.temp_allocator)
+
+	Y_SCALE :: 64.0 / 256.0
+	Y_SHIFT :: -16.0
+
+	for i in 0..<heightmap_image.height {
+		for j in 0..<heightmap_image.width {
+			assert(heightmap_image.channels == 4)
+			heightmap_y := cast(f32)pixels[(i * heightmap_image.width + j) * 4]
+			x := f32(-heightmap_image.height / 2 + i)
+			y := heightmap_y * Y_SCALE + Y_SHIFT
+			z := f32(-heightmap_image.width / 2 + j)
+			append(&vertices, Terrain_Vertex{{ x, y, z }})
+		}
+	}
+
+	index_count := heightmap_image.width * heightmap_image.height * 6
+	indices := make([dynamic]Terrain_Index, 0, index_count, context.temp_allocator)
+
+	for i in 0..<heightmap_image.height - 1 {
+		for j in 0..<heightmap_image.width {
+			for k in 0..<2 {
+				append(&indices, Terrain_Index(j + heightmap_image.width * (i + k)))
+			}
+		}
+	}
+
+	mesh.strip_count = u32(heightmap_image.height - 1)
+	mesh.vertices_per_strip = u32(heightmap_image.width * 2)
+
+	glue.create_mesh(&mesh,
+			 slice.to_bytes(vertices[:]),
+			 size_of(Terrain_Vertex),
+			 terrain_vertex_format[:],
+			 slice.to_bytes(indices[:]),
+			 glue.gl_index(Terrain_Index))
+
+	ok = true
+	return
+}
+
+destroy_terrain_mesh :: proc(mesh: ^Terrain_Mesh) {
+	glue.destroy_mesh(&mesh.mesh)
 }
 
 @(export, rodata)
