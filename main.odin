@@ -55,6 +55,8 @@ main :: proc() {
 
 	gl.ClearColor(0, 0, 0, 1)
 	gl.Enable(gl.DEPTH_TEST)
+	gl.Enable(gl.CULL_FACE)
+	gl.FrontFace(gl.CW)
 
 	prev_time := glue.time()
 
